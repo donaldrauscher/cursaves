@@ -9,7 +9,15 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__, db, export, paths
-from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
+from .backends import (
+    GCSBackend,
+    GitBackend,
+    S3Backend,
+    SyncBackend,
+    get_backend,
+    load_config,
+    save_config,
+)
 from .importer import (
     copy_between_workspaces,
     doctor_audit,
@@ -252,7 +260,7 @@ def cmd_snapshots(args):
 
 
 def cmd_init(args):
-    """Initialize cursaves sync — git repo or S3 bucket."""
+    """Initialize cursaves sync — git repo, S3 bucket, or GCS bucket."""
     sync_dir = paths.get_sync_dir()
     snapshots_dir = sync_dir / "snapshots"
     backend_type = getattr(args, "backend", None) or "git"
@@ -302,11 +310,65 @@ def cmd_init(args):
         print(f"\nDone. Run 'cursaves sync' to synchronize conversations.")
         return
 
+    if backend_type == "gcs":
+        bucket = getattr(args, "bucket", None)
+        if not bucket:
+            print("Error: --bucket is required for the Google Cloud Storage backend.", file=sys.stderr)
+            print("  cursaves init --backend gcs --bucket my-cursor-saves", file=sys.stderr)
+            sys.exit(1)
+
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+
+        config = load_config()
+        config["backend"] = "gcs"
+        config.setdefault("gcs", {})
+        config["gcs"]["bucket"] = bucket
+        if getattr(args, "prefix", None):
+            config["gcs"]["prefix"] = args.prefix
+        if getattr(args, "gcp_project", None):
+            config["gcs"]["project"] = args.gcp_project
+        save_config(config)
+
+        backend = GCSBackend(
+            bucket=bucket,
+            prefix=config["gcs"].get("prefix", "snapshots/"),
+            project=config["gcs"].get("project"),
+        )
+
+        print("Configured Google Cloud Storage backend:")
+        print(f"  Bucket: {bucket}")
+        print(f"  Prefix: {config['gcs'].get('prefix', 'snapshots/')}")
+        if config["gcs"].get("project"):
+            print(f"  Project: {config['gcs']['project']}")
+        print(f"  Snapshots: {snapshots_dir}")
+
+        try:
+            if backend.is_initialized():
+                print("\n  Bucket access verified.")
+            else:
+                print(f"\n  Warning: Could not access bucket '{bucket}'.", file=sys.stderr)
+                print(
+                    "  Check Application Default Credentials and bucket permissions.",
+                    file=sys.stderr,
+                )
+        except Exception as e:
+            print(f"\n  Warning: Could not verify bucket access: {e}", file=sys.stderr)
+
+        print("\nDone. Run 'cursaves sync' to synchronize conversations.")
+        return
+
     # Git backend (default / backward-compatible)
     if paths.is_sync_repo_initialized():
         config = load_config()
-        if config.get("backend") == "s3":
+        cloud = config.get("backend")
+        if cloud == "s3":
             print(f"Currently configured with S3 backend (bucket: {config.get('s3', {}).get('bucket')})")
+        elif cloud == "gcs":
+            print(
+                "Currently configured with Google Cloud Storage backend "
+                f"(bucket: {config.get('gcs', {}).get('bucket')})"
+            )
+        if cloud in ("s3", "gcs"):
             if args.remote:
                 print("Switching to git backend...")
                 config["backend"] = "git"
@@ -333,6 +395,7 @@ def cmd_init(args):
         print(f"\nDone. To sync between machines, add a remote:")
         print(f"  cursaves init --remote git@github.com:you/my-cursaves.git")
         print(f"  cursaves init --backend s3 --bucket my-cursor-saves")
+        print(f"  cursaves init --backend gcs --bucket my-cursor-saves")
 
 
 def cmd_list(args):
@@ -530,7 +593,8 @@ def _require_sync_repo():
             "Run 'cursaves init' first to set up ~/.cursaves/\n\n"
             "Examples:\n"
             "  cursaves init --remote git@github.com:you/my-cursaves.git\n"
-            "  cursaves init --backend s3 --bucket my-cursor-saves",
+            "  cursaves init --backend s3 --bucket my-cursor-saves\n"
+            "  cursaves init --backend gcs --bucket my-cursor-saves",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1704,7 +1768,7 @@ def main():
 
     # ── init ────────────────────────────────────────────────────────
     p_init = subparsers.add_parser(
-        "init", help="Initialize sync (git repo, S3 bucket, etc.)"
+        "init", help="Initialize sync (git repo, S3 bucket, GCS bucket, etc.)"
     )
     p_init.add_argument(
         "--remote", "-r",
@@ -1712,20 +1776,24 @@ def main():
     )
     p_init.add_argument(
         "--backend", "-b",
-        choices=["git", "s3"],
+        choices=["git", "s3", "gcs"],
         help="Sync backend to use (default: git)",
     )
     p_init.add_argument(
         "--bucket",
-        help="S3 bucket name (required for --backend s3)",
+        help="Bucket name (required for --backend s3 or gcs)",
     )
     p_init.add_argument(
         "--prefix",
-        help="S3 key prefix (default: snapshots/)",
+        help="Object prefix for S3 or GCS (default: snapshots/)",
     )
     p_init.add_argument(
         "--region",
         help="AWS region for S3 bucket",
+    )
+    p_init.add_argument(
+        "--gcp-project",
+        help="GCP project ID for Google Cloud Storage (optional; inferred from credentials if omitted)",
     )
     p_init.set_defaults(func=cmd_init)
 
